@@ -1,82 +1,174 @@
-from flask import Flask, request, jsonify
-import requests, os, json, time
+import os
+import json
+import time
+import random
+import asyncio
+import requests
+from datetime import datetime
+from aiohttp import web
+from dotenv import load_dotenv
 
-app = Flask(__name__)
+# Load .env
+load_dotenv()
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-DONORS_FILE = "donors.json"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OXAPAY_KEY = os.getenv("OXAPAY_KEY")
+CHANNEL = os.getenv("CHANNEL")  # @scriptdropx
+DONATION_LINK = os.getenv("DONATION_LINK")
+GOAL = 500.0  # USD
 
-def save_donor(record):
-    try:
-        if os.path.exists(DONORS_FILE):
-            with open(DONORS_FILE, "r") as f:
-                data = json.load(f)
-        else:
-            data = []
-        data.append(record)
-        with open(DONORS_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print("save error:", e)
+# File to store donations
+DONATION_FILE = "donations.json"
 
-def notify_telegram(text):
+# Update intervals
+PROGRESS_INTERVAL = 120  # seconds
+MOTIVATION_INTERVAL = 30  # seconds
+
+# Motivation messages
+MOTIVATION_MSGS = [
+    "🚀 Be part of the elite! Donate & join the team.",
+    "💪 Your contribution keeps the scripts alive.",
+    "🔥 Every donation counts! Let’s hit the goal together.",
+    "🎯 Support the project & get early updates.",
+    "💰 Donate now & be part of the top donors!",
+    "📈 Help push the community forward!",
+    "💎 Exclusive scripts will be unlocked with your support.",
+    "🤝 Join the movement: donate, support, succeed.",
+    "⚡ Every $ counts! Don’t wait.",
+    "🎉 Be featured as a top donor in the channel!"
+]
+
+# In-memory store of last posted messages to delete
+last_motivation_msg_id = None
+last_progress_msg_id = None
+
+# Load donations from file
+if os.path.exists(DONATION_FILE):
+    with open(DONATION_FILE, "r") as f:
+        donations = json.load(f)
+else:
+    donations = []
+
+# Helper functions
+def save_donations():
+    with open(DONATION_FILE, "w") as f:
+        json.dump(donations, f, indent=2)
+
+def total_received():
+    return sum(d["amount"] for d in donations)
+
+def remaining_amount():
+    return max(0, GOAL - total_received())
+
+def get_progress_bar():
+    total_blocks = 10
+    filled = int((total_received() / GOAL) * total_blocks)
+    bar = "🟩" * filled + "⬜" * (total_blocks - filled)
+    return bar
+
+def top_donors():
+    sorted_list = sorted(donations, key=lambda x: x["amount"], reverse=True)
+    return sorted_list[:3]
+
+def format_progress_message():
+    msg = f"💰 Donation Tracker\nGoal: ${GOAL:.2f}\n\n"
+    msg += f"Received: ${total_received():.2f}\n"
+    msg += f"Remaining: ${remaining_amount():.2f}\n\n"
+    msg += f"Progress: {get_progress_bar()}"
+    return msg
+
+def format_donor_message(donor):
+    name = donor.get("name") or "Anonymous"
+    amt = donor["amount"]
+    return f"🎉 {name} just donated ${amt:.2f}! Thanks for supporting the project! 🚀"
+
+# Telegram helpers
+def telegram_send(text, reply_to=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        print("telegram resp:", r.status_code, r.text)
-        return r
-    except Exception as e:
-        print("telegram send error:", e)
-
-@app.route("/callback", methods=["POST"])
-def oxapay_callback():
-    try:
-        data = request.get_json(force=True)
-    except Exception as e:
-        print("bad json:", e)
-        return jsonify({"status":"bad_request"}), 400
-
-    print("🔔 Received callback:", data)
-
-    amount = data.get("amount") or data.get("value") or "0"
-    currency = data.get("currency") or "USDT"
-    name = data.get("name") or ""
-    note = data.get("note") or ""
-    txid = data.get("txid") or ""
-
-    try:
-        amount_f = float(amount)
-    except:
-        amount_f = 0.0
-
-    rec = {
-        "time": int(time.time()),
-        "amount": amount_f,
-        "currency": currency,
-        "name": name,
-        "note": note,
-        "txid": txid,
-        "raw": data
+    data = {
+        "chat_id": CHANNEL,
+        "text": text,
+        "parse_mode": "Markdown"
     }
-    save_donor(rec)
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
+    resp = requests.post(url, data=data)
+    if resp.ok:
+        return resp.json()["result"]["message_id"]
+    return None
 
-    who = note if note else (name if name else "Anonymous")
-    text = (
-        f"🎉 *New Donation Received*\n\n"
-        f"💰 Amount: *{amount_f:.2f}* {currency}\n"
-        f"👤 Donor: *{who}*\n"
-        f"🧾 Note: `{note}`\n"
-        f"🔗 TX: `{txid}`"
-    )
+def telegram_edit(message_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    data = {
+        "chat_id": CHANNEL,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    requests.post(url, data=data)
 
-    notify_telegram(text)
-    return jsonify({"status":"ok"}), 200
+def telegram_delete(message_id):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    data = {
+        "chat_id": CHANNEL,
+        "message_id": message_id
+    }
+    requests.post(url, data=data)
 
-@app.route("/", methods=["GET"])
-def index():
-    return "✅ OxaPay Callback Server is running."
+# Donation callback server
+async def handle_callback(request):
+    try:
+        data = await request.json()
+        # Example: data = {"name": "user", "amount": 10.0}
+        donor_name = data.get("name", "Anonymous")
+        amount = float(data.get("amount", 0))
+        if amount <= 0:
+            return web.json_response({"status": "ignored"})
+        donation = {"name": donor_name, "amount": amount, "time": datetime.utcnow().isoformat()}
+        donations.append(donation)
+        save_donations()
+        # Send donation received message
+        telegram_send(format_donor_message(donation))
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        return web.json_response({"status": "error", "detail": str(e)})
+
+# Background tasks
+async def progress_updater():
+    global last_progress_msg_id
+    while True:
+        msg = format_progress_message()
+        if last_progress_msg_id:
+            try:
+                telegram_edit(last_progress_msg_id, msg)
+            except:
+                last_progress_msg_id = telegram_send(msg)
+        else:
+            last_progress_msg_id = telegram_send(msg)
+        await asyncio.sleep(PROGRESS_INTERVAL)
+
+async def motivation_poster():
+    global last_motivation_msg_id
+    while True:
+        msg = random.choice(MOTIVATION_MSGS) + f"\nDonate here: {DONATION_LINK}"
+        msg_id = telegram_send(msg)
+        if last_motivation_msg_id:
+            telegram_delete(last_motivation_msg_id)
+        last_motivation_msg_id = msg_id
+        await asyncio.sleep(MOTIVATION_INTERVAL)
+
+# Run server + tasks
+async def main():
+    app = web.Application()
+    app.router.add_post("/callback", handle_callback)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000)))
+    await site.start()
+    print("Server running on port", os.environ.get("PORT", 10000))
+
+    # Start background tasks
+    await asyncio.gather(progress_updater(), motivation_poster())
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    asyncio.run(main())
