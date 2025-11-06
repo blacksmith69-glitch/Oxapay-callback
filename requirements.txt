@@ -1,2 +1,5 @@
 flask
 requests
+aiohttp
+python-dotenv
+requests
